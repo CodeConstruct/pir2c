@@ -2,16 +2,19 @@
 // https://github.com/archaelus/ruspirate
 // MIT license
 
-use serial::SystemPort;
+use serial_core::SerialPort;
 use std::str::FromStr;
-use std::result::Result;
 use std::io::{Read, Write};
 use std::iter;
 
-use failure::{Error,Fail};
+use pretty_hex::PrettyHex;
+
+use thiserror::Error;
+
+type Result<A, E = CallError> = core::result::Result<A, E>;
 
 pub struct I2CConn {
-    port: SystemPort,
+    port: Box<dyn SerialPort>,
 }
 
 pub type Addr = u8;
@@ -34,26 +37,58 @@ impl BusSettings {
     }
 }
 
-#[derive(Debug, Fail)]
-enum CallError {
-    #[fail(display="sent: {:?} expected {:?}, received {:?}",
-           sent, expected, received)]
-    InvalidReply { sent: Message, expected: Vec<u8>, received: Vec<u8> }
+#[derive(Debug, Error)]
+pub enum CallError {
+    #[error("sent: {:?}\nexpected:\n{:?}\nreceived:\n{:?}",
+           sent, expected.hex_dump(), received.hex_dump())]
+    InvalidReply { sent: Message, expected: Vec<u8>, received: Vec<u8> },
+    #[error("IO error")]
+    Io(#[from] std::io::Error),
+    #[error("Couldn't enter raw bitbang mode")]
+    NoBitbang,
 }
 
 impl I2CConn {
-    pub fn new(port: SystemPort) -> Self {
-        Self { port: port }
+    pub fn new(port: impl SerialPort + 'static) -> Result<Self> {
+        let port = Box::new(port);
+        let mut s = Self { port };
+        s.enter_bbio()?;
+        Ok(s)
     }
 
-    pub fn test(&mut self) -> Result<(), Error> {
-        self.call(&Message::I2CVSN)?;
+    fn enter_bbio(&mut self) -> Result<()> {
+        // self.port.write_all(b"\r\r\r\r\r\r\r\r\r\r#")?;
+        for _ in 0..30 {
+            println!("wr");
+            self.port.write_all(&[0x0])?;
+            let mut x = [0u8];
+            self.port.read_exact(&mut x)?;
+            if x[0] == b'B' {
+                let mut x = [0u8; 4];
+                self.port.read_exact(&mut x)?;
+                if &x == b"BIO1" {
+                    println!("good")    ;
+                    return Ok(())
+                }
+            }
+        }
+
+        Err(CallError::NoBitbang)
+    }
+
+    pub fn test(&mut self) -> Result<(), CallError> {
+
+        let x = self.call(&Message::I2CMode)?;
+        println!("i2  {:?}", x.hex_dump());
+
+        let x = self.call(&Message::I2CVSN)?;
+        println!("i2  {:?}", x.hex_dump());
         Ok(())
     }
 
-    fn call(&mut self, msg: &Message) -> Result<Vec<u8>, Error> {
+    fn call(&mut self, msg: &Message) -> Result<Vec<u8>, CallError> {
         self.port.write_all(&msg.send())?;
-        let good_reply = msg.expect().expect("Couldn't encode message");
+        let good_reply = msg.expect().expect("Couldn't expect message");
         let mut reply = iter::repeat::<u8>(0)
             .take(good_reply.len()).collect::<Vec<u8>>();
 
@@ -67,7 +102,7 @@ impl I2CConn {
         }
     }
 
-    pub fn configure(&mut self, settings: &BusSettings) -> Result<(), Error> {
+    pub fn configure(&mut self, settings: &BusSettings) -> Result<(), CallError> {
         self.call(&Message::SetSpeed(settings.speed))?;
         self.call(&Message::Configure(settings.power,
                                       settings.voltage.is_some(),
@@ -80,7 +115,7 @@ impl I2CConn {
 impl Drop for I2CConn {
     fn drop(&mut self) {
         let _ = self.call(&Message::Configure(false,false,false,false));
-        let _ = self.call(&Message::ExitToBBIO);
+        let _ = self.call(&Message::ResetBusPirate);
     }
 }
 
@@ -232,7 +267,9 @@ impl Drop for I2CConn {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    ExitToBBIO,
+    I2CMode,
+    ResetBusPirate,
+
     I2CVSN,
     StartBit,
     StopBit,
@@ -300,7 +337,9 @@ use std::iter::Extend;
 impl Message {
     pub fn send(&self) -> Vec<u8> {
         match *self {
-            ExitToBBIO => vec![0b00000000],
+            I2CMode => vec![0b00000010],
+            ResetBusPirate => vec![0b00001111],
+
             I2CVSN => vec![0b00000001],
             StartBit => vec![0b00000010],
             StopBit => vec![0b00000011],
@@ -336,7 +375,10 @@ impl Message {
 
     pub fn expect(&self) -> Option<Vec<u8>> {
         match *self {
-            ExitToBBIO  => Some(vec![b'B', b'B', b'I', b'O', b'1']),
+            // The first 'B' is already consumed
+            I2CMode  => Some(vec![b'I', b'2', b'C', b'1']),
+            ResetBusPirate  => Some(vec![1]),
+
             I2CVSN  => Some(vec![b'I', b'2', b'C', b'1']),
             StartBit => Some(vec![0b00000001]),
             StopBit => Some(vec![0b00000001]),

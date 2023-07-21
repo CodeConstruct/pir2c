@@ -2,14 +2,18 @@
 // https://github.com/archaelus/ruspirate
 // MIT license
 
-use serial_core::SerialPort;
-use std::str::FromStr;
-use std::io::{Read, Write};
-use std::iter;
-
-use pretty_hex::PrettyHex;
+#[allow(unused_imports)]
+use log::{debug, error, info, log, trace, warn};
 
 use thiserror::Error;
+use pretty_hex::PrettyHex;
+
+use std::str::FromStr;
+use std::io::{Read, Write};
+
+use embedded_hal::blocking::i2c as i2c_hal;
+use i2c_hal::SevenBitAddress;
+use serial_core::SerialPort;
 
 type Result<A, E = CallError> = core::result::Result<A, E>;
 
@@ -46,6 +50,10 @@ pub enum CallError {
     Io(#[from] std::io::Error),
     #[error("Couldn't enter raw bitbang mode")]
     NoBitbang,
+    #[error("Bad bulk write")]
+    BadBulkWrite,
+    #[error("Nack to write index {}", index)]
+    NackWrite { index: usize },
 }
 
 impl I2CConn {
@@ -59,7 +67,6 @@ impl I2CConn {
     fn enter_bbio(&mut self) -> Result<()> {
         // self.port.write_all(b"\r\r\r\r\r\r\r\r\r\r#")?;
         for _ in 0..30 {
-            println!("wr");
             self.port.write_all(&[0x0])?;
             let mut x = [0u8];
             self.port.read_exact(&mut x)?;
@@ -67,7 +74,6 @@ impl I2CConn {
                 let mut x = [0u8; 4];
                 self.port.read_exact(&mut x)?;
                 if &x == b"BIO1" {
-                    println!("good")    ;
                     return Ok(())
                 }
             }
@@ -86,13 +92,24 @@ impl I2CConn {
         Ok(())
     }
 
-    fn call(&mut self, msg: &Message) -> Result<Vec<u8>, CallError> {
-        self.port.write_all(&msg.send())?;
-        let good_reply = msg.expect().expect("Couldn't expect message");
-        let mut reply = iter::repeat::<u8>(0)
-            .take(good_reply.len()).collect::<Vec<u8>>();
+    /// Sends a message and reads bytes in response
+    fn send(&mut self, msg: &Message, reply: &mut [u8]) -> Result<()> {
+        let s = msg.send();
+        trace!("send {:?} {:?}", msg, s.hex_dump());
+        self.port.write_all(&s)?;
+        self.port.read_exact(reply)?;
+        trace!("resp {:?}", reply.hex_dump());
+        Ok(())
+    }
 
-        self.port.read_exact(&mut reply)?;
+    /// Sends a message and checks the response matches that expected.
+    ///
+    /// Only applicable for some kinds of messages with known responses
+    fn call(&mut self, msg: &Message) -> Result<Vec<u8>> {
+        let good_reply = msg.expect().expect("Couldn't expect message");
+        let mut reply = [0u8].repeat(good_reply.len());
+        self.send(msg, &mut reply)?;
+
         if reply.eq(&good_reply) {
             Ok(reply)
         } else {
@@ -100,6 +117,23 @@ impl I2CConn {
                                          expected: good_reply,
                                          received: reply })?
         }
+    }
+
+    fn bulk_write(&mut self, bytes: &[u8]) -> Result<()> {
+        for x in bytes.chunks(16) {
+            let mut res = [0].repeat(x.len()+1);
+            self.send(&Message::BulkWrite(x.to_vec()), &mut res)?;
+            if res[0] != 0x01 {
+                return Err(CallError::BadBulkWrite)
+            }
+            for i in 1..res.len() {
+                if res[i] != 0x00 {
+                    return Err(CallError::NackWrite { index: i-1 });
+                }
+
+            }
+        }
+        Ok(())
     }
 
     pub fn configure(&mut self, settings: &BusSettings) -> Result<(), CallError> {
@@ -118,6 +152,95 @@ impl Drop for I2CConn {
         let _ = self.call(&Message::ResetBusPirate);
     }
 }
+
+impl i2c_hal::Write for I2CConn {
+    type Error = CallError;
+
+    fn write(&mut self, address: SevenBitAddress, bytes: &[u8]) -> Result<()> {
+        trace!("write {:?}", bytes.hex_dump());
+        self.call(&Message::StartBit)?;
+
+        let mut v = vec![address << 1];
+        v.extend_from_slice(bytes);
+        self.bulk_write(&v)?;
+
+        self.call(&Message::StopBit)?;
+        trace!("write done");
+        Ok(())
+    }
+}
+
+impl i2c_hal::Read for I2CConn {
+    type Error = CallError;
+
+    fn read(&mut self, address: SevenBitAddress, bytes: &mut [u8]) -> Result<()> {
+        self.call(&Message::StartBit)?;
+
+        let v = vec![address << 1];
+        self.bulk_write(&v)?;
+
+        self.call(&Message::StartBit)?;
+        let v = vec![address << 1 | 1];
+        self.bulk_write(&v)?;
+        for x in bytes.iter_mut() {
+            let mut tmp = [0u8];
+            self.send(&Message::ReadByte, tmp.as_mut_slice())?;
+            // TODO nack last one
+            self.call(&Message::AckBit)?;
+            *x = tmp[0];
+        }
+
+        self.call(&Message::StopBit)?;
+        Ok(())
+    }
+}
+
+impl i2c_hal::WriteRead for I2CConn {
+    type Error = CallError;
+
+    fn write_read(&mut self, address: SevenBitAddress, 
+        bytes: &[u8],
+        buffer: &mut [u8]) -> Result<()> {
+        self.call(&Message::StartBit)?;
+
+        // write
+        let mut v = vec![address << 1];
+        v.extend(bytes);
+        self.bulk_write(&v)?;
+
+        self.call(&Message::StartBit)?;
+        // read
+        let v = vec![address << 1 | 1];
+        self.bulk_write(&v)?;
+        for x in buffer.iter_mut() {
+            let mut tmp = [0u8];
+            self.send(&Message::ReadByte, tmp.as_mut_slice())?;
+            // TODO nack last one
+            // self.call(&Message::AckBit)?;
+            self.call(&Message::NackBit)?;
+            *x = tmp[0];
+        }
+
+        self.call(&Message::StopBit)?;
+        Ok(())
+    }
+}
+// impl i2c_hal::Transactional for I2CConn {
+//     type Error = CallError;
+
+//     fn exec<'a>(&mut self, address: SevenBitAddress,
+//         operations: &mut [Operation<'a>]) -> Result<()> {
+//         self.call(&Message::StartBit)?;
+
+//         for o in operations {
+//         }
+
+//         self.call(&Message::StopBit)?;
+//         Ok(())
+
+//     }
+
+// }
 
 // 00000000 - Exit to bitbang mode, responds "BBIOx"
 // This command resets the Bus Pirate into raw bitbang mode from the
@@ -282,7 +405,7 @@ pub enum Message {
     Configure(bool, bool, bool, bool),
     PullUpSelect(PullUp),
     SetSpeed(Speed),
-    WriteThenRead(Vec<u8>, u8)
+    WriteThenRead(Vec<u8>, usize)
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -368,6 +491,15 @@ impl Message {
             },
             SetSpeed(speed) => {
                 vec![0b0110_0000 | speed as u8]
+            },
+            WriteThenRead(ref write, read_len) => {
+                assert!(write.len() <= 4096, "max WriteThenRead write is 4096");
+                assert!(read_len <= 4096, "max WriteThenRead read is 4096");
+                let mut v = vec![0x08u8, 
+                    (write.len() >> 8) as u8, write.len() as u8,
+                    (read_len >> 8) as u8, read_len as u8];
+                v.extend(write);
+                v
             },
             _ => unimplemented!()
         }

@@ -7,11 +7,14 @@ keywords = ["embedded-hal"]
 [dependencies]
 thiserror = "1"
 pretty-hex = "0.3"
+log = "0.4"
 
 serial-core = "0.4"
 
+embedded-hal = "0.2"
 
 [dev-dependencies]
+env_logger = "0.10"
 anyhow = "1"
 serial = "0.4"
 argh = "0.1"

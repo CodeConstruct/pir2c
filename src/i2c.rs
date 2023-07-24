@@ -11,8 +11,7 @@ use pretty_hex::PrettyHex;
 use std::str::FromStr;
 use std::io::{Read, Write};
 
-use embedded_hal::blocking::i2c as i2c_hal;
-use i2c_hal::SevenBitAddress;
+use embedded_hal::i2c::{self, NoAcknowledgeSource};
 use serial_core::SerialPort;
 
 type Result<A, E = CallError> = core::result::Result<A, E>;
@@ -153,94 +152,84 @@ impl Drop for I2CConn {
     }
 }
 
-impl i2c_hal::Write for I2CConn {
-    type Error = CallError;
-
-    fn write(&mut self, address: SevenBitAddress, bytes: &[u8]) -> Result<()> {
-        trace!("write {:?}", bytes.hex_dump());
+impl embedded_hal::i2c::I2c for I2CConn {
+    fn transaction(
+            &mut self,
+            address: u8,
+            operations: &mut [i2c::Operation<'_>],
+        ) -> Result<(), Self::Error> {
         self.call(&Message::StartBit)?;
 
-        let mut v = vec![address << 1];
-        v.extend_from_slice(bytes);
-        self.bulk_write(&v)?;
-
-        self.call(&Message::StopBit)?;
-        trace!("write done");
-        Ok(())
-    }
-}
-
-impl i2c_hal::Read for I2CConn {
-    type Error = CallError;
-
-    fn read(&mut self, address: SevenBitAddress, bytes: &mut [u8]) -> Result<()> {
-        self.call(&Message::StartBit)?;
-
-        let v = vec![address << 1];
-        self.bulk_write(&v)?;
-
-        self.call(&Message::StartBit)?;
-        let v = vec![address << 1 | 1];
-        self.bulk_write(&v)?;
-        for x in bytes.iter_mut() {
-            let mut tmp = [0u8];
-            self.send(&Message::ReadByte, tmp.as_mut_slice())?;
-            // TODO nack last one
-            self.call(&Message::AckBit)?;
-            *x = tmp[0];
+        enum Prev {
+            None,
+            Read,
+            Write,
         }
 
-        self.call(&Message::StopBit)?;
-        Ok(())
-    }
-}
-
-impl i2c_hal::WriteRead for I2CConn {
-    type Error = CallError;
-
-    fn write_read(&mut self, address: SevenBitAddress, 
-        bytes: &[u8],
-        buffer: &mut [u8]) -> Result<()> {
-        self.call(&Message::StartBit)?;
-
-        // write
-        let mut v = vec![address << 1];
-        v.extend(bytes);
-        self.bulk_write(&v)?;
-
-        self.call(&Message::StartBit)?;
-        // read
-        let v = vec![address << 1 | 1];
-        self.bulk_write(&v)?;
-        for x in buffer.iter_mut() {
-            let mut tmp = [0u8];
-            self.send(&Message::ReadByte, tmp.as_mut_slice())?;
-            // TODO nack last one
-            // self.call(&Message::AckBit)?;
-            self.call(&Message::NackBit)?;
-            *x = tmp[0];
+        let mut prev = Prev::None;
+        let last_op = operations.len() - 1;
+        for (i, op) in operations.iter_mut().enumerate() {
+            match op {
+                i2c::Operation::Read(buf) => {
+                    if matches!(prev, Prev::Write) {
+                        self.call(&Message::StartBit)?;
+                    }
+                    prev = Prev::Read;
+                    // do the read
+                    let v = vec![address << 1 | 1];
+                    self.bulk_write(&v)?;
+                    let last_byte = buf.len() - 1;
+                    for (b, x) in buf.iter_mut().enumerate() {
+                        let mut tmp = [0u8];
+                        self.send(&Message::ReadByte, tmp.as_mut_slice())?;
+                        if i == last_op && b == last_byte {
+                            // nack the last one
+                            self.call(&Message::NackBit)?;
+                        } else {
+                            self.call(&Message::AckBit)?;
+                        }
+                        *x = tmp[0];
+                    }
+                }
+                i2c::Operation::Write(buf) => {
+                    if matches!(prev, Prev::Read) {
+                        self.call(&Message::StartBit)?;
+                    }
+                    prev = Prev::Write;
+                    // do the write
+                    let mut v = vec![address << 1 | 1];
+                    v.extend(*buf);
+                    self.bulk_write(&v)?;
+                }
+            }
         }
-
         self.call(&Message::StopBit)?;
         Ok(())
     }
 }
-// impl i2c_hal::Transactional for I2CConn {
-//     type Error = CallError;
 
-//     fn exec<'a>(&mut self, address: SevenBitAddress,
-//         operations: &mut [Operation<'a>]) -> Result<()> {
-//         self.call(&Message::StartBit)?;
+impl embedded_hal::i2c::ErrorType for I2CConn {
+    type Error = CallError;
+}
 
-//         for o in operations {
-//         }
-
-//         self.call(&Message::StopBit)?;
-//         Ok(())
-
-//     }
-
-// }
+impl embedded_hal::i2c::Error for CallError {
+    fn kind(&self) -> i2c::ErrorKind {
+        use i2c::ErrorKind;
+        match self {
+            Self::Io(_) => ErrorKind::Bus,
+            Self::NackWrite { index } => {
+                let src = if *index == 0 {
+                    i2c::NoAcknowledgeSource::Address
+                } else {
+                    i2c::NoAcknowledgeSource::Data
+                };
+                ErrorKind::NoAcknowledge(src)
+            },
+            Self::BadBulkWrite => ErrorKind::Bus,
+            _ => ErrorKind::Other
+        }
+    }
+}
 
 // 00000000 - Exit to bitbang mode, responds "BBIOx"
 // This command resets the Bus Pirate into raw bitbang mode from the

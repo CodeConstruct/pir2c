@@ -11,7 +11,7 @@ use pretty_hex::PrettyHex;
 use std::str::FromStr;
 use std::io::{Read, Write};
 
-use embedded_hal::i2c::{self, NoAcknowledgeSource};
+use embedded_hal::i2c;
 use serial_core::SerialPort;
 
 type Result<A, E = CallError> = core::result::Result<A, E>;
@@ -59,8 +59,20 @@ impl I2CConn {
     pub fn new(port: impl SerialPort + 'static) -> Result<Self> {
         let port = Box::new(port);
         let mut s = Self { port };
-        s.enter_bbio()?;
+        s.init()?;
         Ok(s)
+    }
+
+    fn init(&mut self) -> Result<()> {
+        self.enter_bbio()?;
+
+        let x = self.call(&Message::I2CMode)?;
+        trace!("Entered i2c mode, ret {}", x.hex_dump());
+
+        // unsure if necessary
+        // self.call(&Message::SetSpeed(Speed::Hz400000))?;
+
+        Ok(())
     }
 
     fn enter_bbio(&mut self) -> Result<()> {
@@ -73,6 +85,7 @@ impl I2CConn {
                 let mut x = [0u8; 4];
                 self.port.read_exact(&mut x)?;
                 if &x == b"BIO1" {
+                    trace!("Entered bbio");
                     return Ok(())
                 }
             }
@@ -147,6 +160,7 @@ impl I2CConn {
 
 impl Drop for I2CConn {
     fn drop(&mut self) {
+        debug!("pir2c Drop");
         let _ = self.call(&Message::Configure(false,false,false,false));
         let _ = self.call(&Message::ResetBusPirate);
     }
@@ -166,9 +180,12 @@ impl embedded_hal::i2c::I2c for I2CConn {
             Write,
         }
 
+        trace!("transaction address {address:02x}");
+
         let mut prev = Prev::None;
         let last_op = operations.len() - 1;
         for (i, op) in operations.iter_mut().enumerate() {
+            trace!("transaction op {:?}", op);
             match op {
                 i2c::Operation::Read(buf) => {
                     if matches!(prev, Prev::Write) {
@@ -197,7 +214,7 @@ impl embedded_hal::i2c::I2c for I2CConn {
                     }
                     prev = Prev::Write;
                     // do the write
-                    let mut v = vec![address << 1 | 1];
+                    let mut v = vec![address << 1];
                     v.extend(*buf);
                     self.bulk_write(&v)?;
                 }
@@ -214,14 +231,14 @@ impl embedded_hal::i2c::ErrorType for I2CConn {
 
 impl embedded_hal::i2c::Error for CallError {
     fn kind(&self) -> i2c::ErrorKind {
-        use i2c::ErrorKind;
+        use i2c::{ErrorKind, NoAcknowledgeSource};
         match self {
             Self::Io(_) => ErrorKind::Bus,
             Self::NackWrite { index } => {
                 let src = if *index == 0 {
-                    i2c::NoAcknowledgeSource::Address
+                    NoAcknowledgeSource::Address
                 } else {
-                    i2c::NoAcknowledgeSource::Data
+                    NoAcknowledgeSource::Data
                 };
                 ErrorKind::NoAcknowledge(src)
             },
@@ -460,10 +477,9 @@ impl Message {
             NackBit => vec![0b00000111],
             StartBusSniffer => vec![0b00001111],
             ExitBusSniffer => vec![0b00001111],
-            BulkWrite(ref bytes) if bytes.len() > 0 && bytes.len() <= 16 => {
-                let mut buf: Vec<u8> = vec![0b0001_0000 |
-                                            0b0001_1111 &
-                                            (bytes.len() - 1) as u8];
+            BulkWrite(ref bytes) => {
+                assert!(bytes.len() > 0 && bytes.len() <= 16, "BulkWrite limited to 16");
+                let mut buf = vec![0b0001_0000 | (bytes.len() - 1) as u8];
                 buf.extend(bytes);
                 buf
             },
@@ -490,7 +506,6 @@ impl Message {
                 v.extend(write);
                 v
             },
-            _ => unimplemented!()
         }
     }
 

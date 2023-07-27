@@ -9,7 +9,7 @@ use thiserror::Error;
 use pretty_hex::PrettyHex;
 
 use std::str::FromStr;
-use std::io::{Read, Write};
+use std::io::{Read, Write, ErrorKind};
 
 use embedded_hal::i2c;
 use serial_core::SerialPort;
@@ -55,6 +55,16 @@ pub enum CallError {
     NackWrite { index: usize },
 }
 
+impl CallError {
+    fn is_timeout(&self) -> bool {
+        if let Self::Io(e) = self {
+            e.kind() == ErrorKind::TimedOut
+        } else {
+            false
+        }
+    }
+}
+
 impl I2CConn {
     pub fn new(port: impl SerialPort + 'static) -> Result<Self> {
         let port = Box::new(port);
@@ -76,11 +86,20 @@ impl I2CConn {
     }
 
     fn enter_bbio(&mut self) -> Result<()> {
-        // self.port.write_all(b"\r\r\r\r\r\r\r\r\r\r#")?;
         for _ in 0..30 {
             self.port.write_all(&[0x0])?;
+
             let mut x = [0u8];
-            self.port.read_exact(&mut x)?;
+            let e = self.port.read_exact(&mut x);
+            if let Err(e) = e {
+                let e: CallError = e.into();
+                if e.is_timeout() {
+                    // timeout is expected for the un-responded 0x00s
+                    trace!("got normal read timeout");
+                    continue
+                }
+                return Err(e)
+            }
             if x[0] == b'B' {
                 let mut x = [0u8; 4];
                 self.port.read_exact(&mut x)?;

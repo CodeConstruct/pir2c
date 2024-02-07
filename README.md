@@ -6,8 +6,6 @@ This allows using Bus Pirate
 The Bus Pirate protocol side is thanks to Geoff Cant's
 [ruspirate](https://github.com/archaelus/ruspirate)
 
-It currently targets embedded-hal 1.0.0-alpha.10 
-
 Performance is fairly slow, but is usable for some circumstances.
 
 To get out of BBIO mode when you reattach a serial terminal, send *break* then *ctrl-o*
